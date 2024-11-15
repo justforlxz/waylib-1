@@ -13,6 +13,8 @@
 #include "wbufferrenderer_p.h"
 #include "wquicktextureproxy.h"
 #include "weventjunkman.h"
+#include "winputdevice.h"
+#include "wseat.h"
 
 #include "platformplugin/qwlrootsintegration.h"
 #include "platformplugin/qwlrootscreen.h"
@@ -1518,10 +1520,14 @@ WOutputRenderWindow::WOutputRenderWindow(QObject *parent)
     // see [QQuickApplicationWindow](qt6/qtdeclarative/src/quicktemplates/qquickapplicationwindow.cpp)
     contentItem()->setFlag(QQuickItem::ItemIsFocusScope);
     contentItem()->setFocus(true);
+
+    qGuiApp->installEventFilter(this);
 }
 
 WOutputRenderWindow::~WOutputRenderWindow()
 {
+    qGuiApp->removeEventFilter(this);
+
     renderControl()->disconnect(this);
     renderControl()->invalidate();
     renderControl()->deleteLater();
@@ -1842,8 +1848,7 @@ void WOutputRenderWindow::update()
 {
     Q_D(WOutputRenderWindow);
     for (auto o : std::as_const(d->outputs))
-        o->update(); // make contents to dirty
-    d->scheduleDoRender();
+        o->update(); // will scheduleDoRender
 }
 
 void WOutputRenderWindow::update(WOutputViewport *output)
@@ -1937,6 +1942,20 @@ bool WOutputRenderWindow::event(QEvent *event)
         return true;
 
     return isAccepted;
+}
+
+bool WOutputRenderWindow::eventFilter(QObject *watched, QEvent *event)
+{
+    if (event->isInputEvent() && watched->isQuickItemType()) {
+        auto ie = static_cast<QInputEvent*>(event);
+        auto device = WInputDevice::from(ie->device());
+        Q_ASSERT(device);
+        Q_ASSERT(device->seat());
+        if (device->seat()->filterEventBeforeDisposeStage(qobject_cast<QQuickItem*>(watched), ie))
+            return true;
+    }
+
+    return QQuickWindow::eventFilter(watched, event);
 }
 
 WAYLIB_SERVER_END_NAMESPACE

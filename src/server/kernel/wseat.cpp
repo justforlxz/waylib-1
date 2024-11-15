@@ -46,7 +46,7 @@ Q_LOGGING_CATEGORY(qLcWlrGestureEvents, "waylib.server.seat.events.gesture", QtW
 #if QT_CONFIG(wheelevent)
 class Q_DECL_HIDDEN WSeatWheelEvent : public QWheelEvent {
 public:
-    WSeatWheelEvent(wlr_axis_source_t wlr_source, double wlr_delta,
+    WSeatWheelEvent(wlr_axis_source_t wlr_source, double wlr_delta, Qt::Orientation orientation,
                     const QPointF &pos, const QPointF &globalPos, QPoint pixelDelta, QPoint angleDelta,
                     Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers, Qt::ScrollPhase phase,
                     bool inverted, Qt::MouseEventSource source = Qt::MouseEventNotSynthesized,
@@ -54,16 +54,18 @@ public:
         : QWheelEvent(pos, globalPos, pixelDelta, angleDelta, buttons, modifiers, phase, inverted, source, device)
         , m_wlrSource(wlr_source)
         , m_wlrDelta(wlr_delta)
+        , m_orientation(orientation)
     {
 
     }
 
     inline wlr_axis_source_t wlrSource() const { return m_wlrSource; }
     inline double wlrDelta() const { return m_wlrDelta; }
-
+    inline Qt::Orientation orientation() const { return m_orientation; }
 protected:
     wlr_axis_source_t m_wlrSource;
     double m_wlrDelta;
+    Qt::Orientation m_orientation;
 };
 #endif
 
@@ -401,6 +403,8 @@ public:
     WGlobal::CursorShape cursorShape = WGlobal::CursorShape::Invalid;
 
     QPointer<WSurface> dragSurface;
+
+    bool alwaysUpdateHoverTarget = false;
 };
 
 void WSeatPrivate::on_destroy()
@@ -839,21 +843,23 @@ bool WSeat::sendEvent(WSurface *target, QObject *shellObject, QObject *eventObje
     case QEvent::MouseMove: {
         auto e = static_cast<QMouseEvent*>(event);
         Q_ASSERT(e->source() == Qt::MouseEventNotSynthesized);
-        // received HoverEnter event of next eventObject before HoverLeave event of last eventObject,
-        // so we should check the eventObject is still the same, if not, we should ignore this event
-        if (d->pointerFocusEventObject != eventObject)
-            break;
+        // When begin drag, the wlroots will grab pointer event for drag, and the pointer focus is nullptr.
+        if (d->pointerFocusEventObject) {
+            // received HoverEnter event of next eventObject before HoverLeave event of last eventObject,
+            // so we should check the eventObject is still the same, if not, we should ignore this event
+            if (d->pointerFocusEventObject != eventObject)
+                break;
+        }
         d->doNotifyMotion(target, eventObject, e->position(), e->timestamp());
         break;
     }
     case QEvent::Wheel: {
         if (auto we = dynamic_cast<WSeatWheelEvent*>(event)) {
-            Qt::Orientation orientation = we->angleDelta().x() == 0 ? Qt::Vertical : Qt::Horizontal;
             d->doNotifyAxis(static_cast<wlr_axis_source>(we->wlrSource()),
-                        orientation,
-                        we->wlrDelta(),
-                        -(we->angleDelta().x()+we->angleDelta().y()), // one of them must be 0, restore to wayland direction here.
-                        we->timestamp());
+                            we->orientation(),
+                            we->wlrDelta(),
+                            -(we->angleDelta().x() + we->angleDelta().y()), // one of them must be 0, restore to wayland direction here.
+                            we->timestamp());
         } else {
             qWarning("An Wheel event was received that was not sent by wlroot and will be ignored");
         }
@@ -1037,6 +1043,39 @@ void WSeat::setKeyboard(WInputDevice *newKeyboard)
     Q_EMIT this->keyboardChanged();
 }
 
+bool WSeat::alwaysUpdateHoverTarget() const
+{
+    W_DC(WSeat);
+    return d->alwaysUpdateHoverTarget;
+}
+
+void WSeat::setAlwaysUpdateHoverTarget(bool newIgnoreSurfacePointerEventExclusiveGrabber)
+{
+    W_D(WSeat);
+    if (d->alwaysUpdateHoverTarget == newIgnoreSurfacePointerEventExclusiveGrabber)
+        return;
+    d->alwaysUpdateHoverTarget = newIgnoreSurfacePointerEventExclusiveGrabber;
+
+    if (d->alwaysUpdateHoverTarget) {
+        for (WInputDevice *device : std::as_const(d->deviceList)) {
+            // Qt will auto grab the pointer event for QQuickItem when mouse pressed
+            // until mouse released. But we want always update the HoverEnter/Leave's
+            // WSurfaceItem between drag move.
+            if (device->exclusiveGrabber() == device->hoverTarget())
+                device->setExclusiveGrabber(nullptr);
+        }
+    } else {
+        for (WInputDevice *device : std::as_const(d->deviceList)) {
+            if (!device->exclusiveGrabber()) {
+                // Restore
+                device->setExclusiveGrabber(device->hoverTarget());
+            }
+        }
+    }
+
+    Q_EMIT alwaysUpdateHoverTargetChanged();
+}
+
 void WSeat::notifyMotion(WCursor *cursor, WInputDevice *device, uint32_t timestamp)
 {
     W_D(WSeat);
@@ -1083,17 +1122,11 @@ void WSeat::notifyAxis(WCursor *cursor, WInputDevice *device, wlr_axis_source_t 
     const QPointF &global = cursor->position();
     const QPointF local = w ? global - QPointF(w->position()) : QPointF();
 
-    QPoint angleDelta, pixelDelta;
-    if (Qt::Horizontal == orientation) {
-        angleDelta = QPoint(-delta, 0);
-        pixelDelta = QPoint(-delta_discrete, 0);
-    } else {
-        angleDelta = QPoint(0, -delta);
-        pixelDelta = QPoint(0, -delta_discrete);
-    }
-
-    WSeatWheelEvent e(source, delta, local, global, pixelDelta, angleDelta, Qt::NoButton, d->keyModifiers,
-                      Qt::NoScrollPhase, false, Qt::MouseEventNotSynthesized, qwDevice);
+    // Refer to https://github.com/qt/qtwayland/blob/774c0be247bd04362fc7713919ac151c44e34ced/src/client/qwaylandinputdevice.cpp#L1089
+    // The direction in Qt event is in the opposite direction of wayland one, generate a event identical to Qt's direction.
+    QPoint angleDelta = orientation == Qt::Horizontal ? QPoint(-delta_discrete, 0) : QPoint(0, -delta_discrete);
+    WSeatWheelEvent e(source, delta, orientation, local, global, QPoint(), angleDelta, Qt::NoButton, d->keyModifiers,
+                  Qt::NoScrollPhase, false, Qt::MouseEventNotSynthesized, qwDevice);
     e.setTimestamp(timestamp);
 
     if (w) {
@@ -1440,6 +1473,17 @@ bool WSeat::filterEventBeforeDisposeStage(QWindow *targetWindow, QInputEvent *ev
 
     d->addEventState(event);
 
+    if (Q_UNLIKELY(d->alwaysUpdateHoverTarget) && event->isPointerEvent()) {
+        auto pe = static_cast<QPointerEvent*>(event);
+        if (pe->isEndEvent()) {
+            auto device = WInputDevice::from(event->device());
+            if (!device->exclusiveGrabber()) {
+                // Restore the grabber, See alwaysUpdateHoverTarget
+                device->setExclusiveGrabber(device->hoverTarget());
+            }
+        }
+    }
+
     if (Q_UNLIKELY(d->eventFilter)) {
         if (d->eventFilter->beforeDisposeEvent(this, targetWindow, event)) {
             if (event->type() == QEvent::MouseMove || event->type() == QEvent::HoverMove) {
@@ -1450,6 +1494,7 @@ bool WSeat::filterEventBeforeDisposeStage(QWindow *targetWindow, QInputEvent *ev
                 // because the QQuickDeliveryAgent can't get the real last mouse
                 // position, the QQuickWindowPrivate::lastMousePosition is error.
                 if (QQuickWindow *qw = qobject_cast<QQuickWindow*>(targetWindow)) {
+                    Q_ASSERT(event->isSinglePointEvent());
                     const auto pos = static_cast<QSinglePointEvent*>(event)->position();
                     QQuickWindowPrivate::get(qw)->deliveryAgentPrivate()->lastMousePosition = pos;
                 }
@@ -1457,6 +1502,20 @@ bool WSeat::filterEventBeforeDisposeStage(QWindow *targetWindow, QInputEvent *ev
 
             return true;
         }
+    }
+
+    return false;
+}
+
+bool WSeat::filterEventBeforeDisposeStage(QQuickItem *target, QInputEvent *event)
+{
+    if (event->type() == QEvent::HoverEnter) {
+        auto ie = WInputDevice::from(event->device());
+        ie->setHoverTarget(target);
+    } else if (event->type() == QEvent::HoverLeave) {
+        auto ie = WInputDevice::from(event->device());
+        if (ie->hoverTarget() == target)
+            ie->setHoverTarget(nullptr);
     }
 
     return false;
@@ -1471,6 +1530,20 @@ bool WSeat::filterEventAfterDisposeStage(QWindow *targetWindow, QInputEvent *eve
 
     if (event->isAccepted() || d->pendingEvents.at(eventStateIndex).isAccepted) {
         d->pendingEvents.removeAt(eventStateIndex);
+
+        if (Q_UNLIKELY(d->alwaysUpdateHoverTarget) && event->isPointerEvent()) {
+            auto pe = static_cast<QPointerEvent*>(event);
+
+            // Qt will auto grab the pointer event for QQuickItem when mouse pressed
+            // until mouse released. But we want always update the HoverEnter/Leave's
+            // WSurfaceItem between drag move.
+            if (pe->isBeginEvent()) {
+                auto ie = WInputDevice::from(event->device());
+                if (ie->exclusiveGrabber() == ie->hoverTarget())
+                    ie->setExclusiveGrabber(nullptr);
+            }
+        }
+
         return false;
     }
 
